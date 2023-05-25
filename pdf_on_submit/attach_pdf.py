@@ -1,0 +1,164 @@
+"""
+PDF on Submit. Creates a PDF when a document is submitted.
+Copyright (C) 2019  Raffael Meyer <raffael@alyf.de>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+import frappe
+
+from frappe import _
+from frappe import publish_progress
+from frappe.core.api.file import create_new_folder
+from frappe.utils.file_manager import save_file
+from frappe.model.naming import _format_autoname
+from frappe.utils.weasyprint import PrintFormatGenerator
+
+
+def attach_pdf(doc, event=None):
+    settings = frappe.get_single("PDF on Submit Settings")
+
+    if enabled_doctypes := settings.get("enabled_for", {"document_type": doc.doctype}):
+        enabled_doctype = enabled_doctypes[0]
+    else:
+        return
+
+    auto_name = enabled_doctype.auto_name
+    print_format = enabled_doctype.print_format or doc.meta.default_print_format or "Standard"
+    letter_head = enabled_doctype.letter_head or None
+
+    fallback_language = frappe.db.get_single_value("System Settings", "language") or "en"
+    args = {
+        "doctype": doc.doctype,
+        "name": doc.name,
+        "title": doc.get_title(),
+        "lang": getattr(doc, "language", fallback_language),
+        "show_progress": not settings.create_pdf_in_background,
+        "auto_name": auto_name,
+        "print_format": print_format,
+        "letter_head": letter_head,
+        "to_field": enabled_doctype.to_field,
+        "to_field_as_link": enabled_doctype.to_field_as_link
+    }
+
+    if settings.create_pdf_in_background:
+        enqueue(args)
+    else:
+        execute(**args)
+
+
+def enqueue(args):
+    """Add method `execute` with given args to the queue."""
+    frappe.enqueue(method=execute, queue='long',
+                   timeout=30, is_async=True, **args)
+
+
+def execute(doctype, name, title, lang=None, show_progress=True, auto_name=None, print_format=None,
+            letter_head=None, to_field=None, to_field_as_link=None):
+    """
+    Queue calls this method, when it's ready.
+
+    1. Create necessary folders
+    2. Get raw PDF data
+    3. Save PDF file and attach it to the document
+    """
+    progress = frappe._dict(title=_("Creating PDF ..."), percent=0, doctype=doctype, docname=name)
+
+    if lang:
+        frappe.local.lang = lang
+        # unset lang and jenv to load new language
+        frappe.local.lang_full_dict = None
+        frappe.local.jenv = None
+
+    if show_progress:
+        publish_progress(**progress)
+
+    doctype_folder = create_folder(doctype, "Home")
+    title_folder = create_folder(title, doctype_folder)
+
+    if show_progress:
+        progress.percent = 33
+        publish_progress(**progress)
+
+    if frappe.db.get_value("Print Format", print_format, "print_format_builder_beta"):
+        doc = frappe.get_doc(doctype, name)
+        pdf_data = PrintFormatGenerator(print_format, doc, letter_head).render_pdf()
+    else:
+        pdf_data = get_pdf_data(doctype, name, print_format, letter_head)
+
+    if show_progress:
+        progress.percent = 66
+        publish_progress(**progress)
+
+    save_and_attach(pdf_data, doctype, name, title_folder, auto_name, to_field, to_field_as_link)
+
+    if show_progress:
+        progress.percent = 100
+        publish_progress(**progress)
+
+
+def create_folder(folder, parent):
+    """Make sure the folder exists and return it's name."""
+    new_folder_name = "/".join([parent, folder])
+
+    if not frappe.db.exists("File", new_folder_name):
+        create_new_folder(folder, parent)
+
+    return new_folder_name
+
+
+def get_pdf_data(doctype, name, print_format: None, letterhead: None):
+    """Document -> HTML -> PDF."""
+    html = frappe.get_print(doctype, name, print_format, letterhead=letterhead)
+    return frappe.utils.pdf.get_pdf(html)
+
+
+def save_and_attach(content, to_doctype, to_name, folder, auto_name=None, to_field=None, to_field_as_link=None):
+    """
+    Save content to disk and create a File document.
+
+    File document is linked to another document.
+    """
+    if auto_name:
+        doc = frappe.get_doc(to_doctype, to_name)
+        # based on type of format used set_name_form_naming_option return result.
+        pdf_name = set_name_from_naming_options(auto_name, doc)
+        file_name = "{pdf_name}.pdf".format(pdf_name=pdf_name.replace("/", "-"))
+    else:
+        file_name = "{to_name}.pdf".format(to_name=to_name.replace("/", "-"))
+
+    file = save_file(file_name, content, to_doctype, to_name, folder=folder, is_private=0, df=to_field)
+    set_file_to_doctype(to_doctype, to_name, file.file_url, to_field, to_field_as_link)
+
+def set_file_to_doctype(to_doctype, to_name, file_url=None, to_field=None, to_field_as_link=None):
+    try:
+        if to_field and file_url:
+            frappe.db.set_value(to_doctype, to_name, to_field, file_url)
+        if to_field_as_link and file_url:
+            file_name = file_url.split('/')[-1]
+            link = f'<a class="attached-file-link" href="{file_url}" target="_blank">{file_name}</a>'
+            frappe.db.set_value(to_doctype, to_name, to_field_as_link, link)
+    except:
+        pass
+
+
+def set_name_from_naming_options(autoname, doc):
+    """
+    Get a name based on the autoname field option
+    """
+    _autoname = autoname.lower()
+
+    if _autoname.startswith("format:"):
+        return _format_autoname(autoname, doc)
+
+    return doc.name
