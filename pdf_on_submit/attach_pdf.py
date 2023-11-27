@@ -73,6 +73,7 @@ def execute(doctype, name, title, lang=None, show_progress=True, auto_name=None,
     3. Save PDF file and attach it to the document
     """
     progress = frappe._dict(title=_("Creating PDF ..."), percent=0, doctype=doctype, docname=name)
+    title = title.replace('/', '_')
 
     if lang:
         frappe.local.lang = lang
